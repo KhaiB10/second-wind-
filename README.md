@@ -7,7 +7,10 @@ The Tesla P40 (Pascal, 2016) is a cheap 24 GB card, but it is weak at 16-bit flo
 | Tesla P40, Z-Image Turbo, 1024×1024, 8 steps | Time per picture | Speed |
 | --- | --- | --- |
 | Normal (FP32 math, FP8-stored weights) | 72.1 s | 1.0× |
-| **Second Wind, `int8_spike_split`** | **36.1 s** | **2.0×** |
+| Second Wind, INT8 linear layers only | 36.1 s | 2.00× |
+| **Second Wind + INT8 attention kernel** | **31.6 s** | **2.28×** |
+
+Across six different kinds of picture (portrait, night close-up, tall scene, wide landscape, two figures), measured with two seeds each: **2.16× on average**, 2.12× to 2.19×.
 
 **Same picture:** drawn from the same seed, 97.6% of the INT8 picture's lines fall within 3 pixels of the normal-math picture's lines. Two different seeds score 81%.
 
@@ -18,6 +21,18 @@ The Tesla P40 (Pascal, 2016) is a cheap 24 GB card, but it is weak at 16-bit flo
 1. **Weights** are squeezed to 8 bits once, with one scale per output row, and cached on the GPU.
 2. **Inputs** are squeezed to 8 bits on every call, with one scale per token, by a fused CUDA kernel. They are multiplied with `torch._int_mm` (INT8 × INT8 → INT32) and scaled back to float by a second fused kernel. Before fusing, the eight separate prep steps around each multiply ate most of the gain.
 3. **Spike splitting.** A few input channels carry huge outliers, up to 84,000× the average in the feed-forward "down" layers. The node finds them during each layer's first three calls. From then on, those channels go through normal float math and the rest through INT8. This is the LLM.int8() decomposition idea (Dettmers et al., 2022) applied to an image model, and it halves the error in the worst layers.
+
+## The attention kernel
+
+Once the linear layers were fast, attention was the biggest cost (13.9 s of a 72 s picture) and PyTorch's own kernel had nothing better to offer a Pascal card. `attn.py` is a flash-style INT8 attention kernel written for sm_61: one block takes 64 queries, walks the keys 32 at a time with `__dp4a`, keeps a running softmax, and never writes the full score table to memory. Keys and queries are mean-centred first — softmax ignores a constant shift, so this is exact, and it removes the channel spikes that hurt 8-bit math (the SageAttention idea, with the shift added back in fp32 inside the kernel).
+
+| Attention, measured on real Z-Image inputs (4288 tokens, 30 heads) | Time |
+| --- | --- |
+| PyTorch (fp32) | 55.1 ms |
+| Ours, first attempt | 135.9 ms |
+| **Ours, after register blocking and 16-byte loads** | **38.3 ms (1.44×)** |
+
+Error against fp32 attention is 0.73%, and no token falls below 0.99 cosine similarity in the later steps.
 
 ## Install
 
@@ -30,6 +45,7 @@ The Tesla P40 (Pascal, 2016) is a cheap 24 GB card, but it is weak at 16-bit flo
 
 - **Token downsampling in attention (ToDo-style 2×2 key/value pooling).** 1.4× faster again, but it **smeared the linework into blocks**. Z-Image tags each token's position with RoPE before attention, and averaging four neighbours mixes up their position codes. The run with downsampling only in late steps scored 0.967 on our line-match metric and still looked bad. Lesson: judge by eye with side-by-side sheets, not by an edge-counting score.
 - **Spike search on every call** improved accuracy but was slower (1.5×). Searching only in the first three calls and reusing the result kept the accuracy and the speed.
+- **`__dp2a` for the attention blend** (16-bit weights × 8-bit values, 2 multiply-adds per instruction) was *slower* than fp32 blending, 42.1 ms against 38.3 ms, and much less accurate. The blend is limited by moving data, not by arithmetic, so a wider multiply instruction does not help. Quantizing the values to 8 bits with one scale per channel also broke 18% of tokens: a few loud tokens set the scale and crush the quiet ones.
 
 ## Where the time goes now (GPU trace, one picture)
 
@@ -39,7 +55,7 @@ The Tesla P40 (Pascal, 2016) is a cheap 24 GB card, but it is weak at 16-bit flo
 | Attention | 13.9 s | 14.0 s, **now the biggest cost** |
 | Squeeze and unsqueeze (fused kernels) | none | 2.5 s |
 
-**Next:** an INT8 attention kernel for Pascal.
+**Next:** the attention kernel is 1.44× faster than PyTorch's but still well short of what the hardware allows; bigger register tiles and overlapping the next tile's load with the current tile's maths are the obvious places to dig.
 
 ## Limits
 
