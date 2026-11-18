@@ -176,11 +176,18 @@ def _int8_fast(m, x2, split=False):                    # phase 2b
         y = torch._int_mm(xq, m._wqT).float(); y.mul_(amax / 127); y.mul_(m._sw)
         if m._bf is not None: y.add_(m._bf)
     if idx is not None:                                # the spike channels, in normal math
-        try:
-            Wcols = m.weight[:, idx.to(m.weight.device)].to(device=dev, dtype=torch.float32)
-        except Exception:                                # some 8-bit weight formats cannot be indexed directly
-            Wcols = m.weight.to(device=dev, dtype=torch.float32)[:, idx]
-        y.addmm_(xf[:, idx], Wcols.t())
+        # These columns are CACHED on the GPU. They used to be sliced out of m.weight and copied across on
+        # EVERY call, and m.weight lives in host memory, so a GPU trace of one picture showed 1,474 pageable
+        # host-to-device copies costing 6.9 s out of 38.6 s. The spike channels are fixed once calibration
+        # ends - that is what "static" means - so the columns never change and there is nothing to recopy.
+        cache = getattr(m, "_wspike", None)
+        if cache is None or cache[0] is not idx:
+            try:
+                W = m.weight[:, idx.to(m.weight.device)].to(device=dev, dtype=torch.float32)
+            except Exception:                            # some 8-bit weight formats cannot be indexed directly
+                W = m.weight.to(device=dev, dtype=torch.float32)[:, idx]
+            m._wspike = cache = (idx, W.t().contiguous())
+        y.addmm_(xf[:, idx], cache[1])
     return y
 
 
