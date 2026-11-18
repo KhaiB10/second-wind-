@@ -77,6 +77,42 @@ The lesson is not about INT8. We had spent days tuning kernels that were already
 - The cached INT8 weights take about 6 GB of extra GPU memory, and ComfyUI holds that between runs: on a 24 GB card, expect roughly 8.6 GB resident once warm. The cached spike columns are a small addition on top of that.
 - Disabling ECC on the card frees about 1 GB and some memory bandwidth. It needs a cold power cycle, not a reboot.
 
+## Decoding: what 8-bit and 4-bit are actually worth on Pascal
+
+The node above speeds up image generation, where the work is matrix-times-matrix. Generating text is a
+different shape: each word reads every weight exactly once and multiplies it by a single vector. That is
+matrix-times-vector, it is pure memory traffic, and it is where a 24 GB card from 2016 is interesting.
+
+Measured on a P40 (227 GB/s of memory bandwidth, measured, against a rated 347), on Llama-7B layer shapes:
+
+| GEMV kernel | time, 4096x4096 | achieved | error |
+| --- | --- | --- | --- |
+| FP32 | 329 us | 190 GB/s | — |
+| **INT8** | **82 us** | **222 GB/s (97% of the card)** | 0.87% |
+| INT4 (two per byte, group 128) | 125 us | 76 GB/s | 11.7% |
+
+**INT8 decoding runs at 97% of this card's memory bandwidth.** There is nothing left to win there: the
+corridor is full. For a 7B model that is roughly 32 tokens/second, and it is a hardware limit, not a
+software one.
+
+**INT4 is slower than INT8 on Pascal, and not for the reason we expected.** It is not short of bandwidth —
+it uses 76 of 228 GB/s. The unpacking is the limit: every byte holds two weights, and masking, shifting,
+sign-correcting and converting each one costs more instructions than the halved memory traffic saves. On
+hardware with cheap integer-to-float paths this trade wins; on `sm_61` it loses. So 4-bit on Pascal is worth
+having **only to make a model fit** (a 30B at 4 bits is ~15 GB and fits in 22.4; at 8 bits it is 30 GB and
+does not), never for speed.
+
+### The mistake that nearly hid this
+
+Our first GEMV kernels gave one block per output row, and each block read the whole input vector from global
+memory. With 4096 rows that is the input carried across 4096 times: 64 MB of traffic against 16 MB of INT8
+weights. **The weights were never what filled the pipe**, so shrinking them changed nothing — INT8 measured
+75 GB/s and INT4 measured 23, and both looked like failures of quantisation.
+
+Staging the input vector in shared memory, and giving each block 8 rows to share that one copy, took INT8
+from 75 GB/s to 222. The lesson is the same one the spike-column bug taught: *measure what is actually
+crossing the bus before optimising what you assume is.*
+
 ## Credits
 
 Author: **Khai Bustos** ([github.com/KhaiB10](https://github.com/KhaiB10)), developed with Claude (Anthropic). Spike splitting follows *LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale* (Dettmers et al., 2022). MIT license.
