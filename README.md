@@ -113,6 +113,26 @@ Staging the input vector in shared memory, and giving each block 8 rows to share
 from 75 GB/s to 222. The lesson is the same one the spike-column bug taught: *measure what is actually
 crossing the bus before optimising what you assume is.*
 
+## If you came here for text generation, use llama.cpp
+
+Measured on this P40, against the card's 228 GB/s:
+
+| | effective bandwidth | % of the card |
+| --- | --- | --- |
+| llama.cpp (`llama3.1:8b`, 1.9k context) | 195 GB/s | 86% |
+| llama.cpp (`qwen3:14b`, 1.9k context) | 187 GB/s | 82% |
+| our bare INT8 matrix-vector kernel | 222 GB/s | 97% |
+
+Our number is a microbenchmark with no attention, no KV cache and no sampling; llama.cpp's is a whole model
+end to end. **llama.cpp is already near this hardware's limit for text**, using Pascal-specific `__dp4a`
+kernels it has had for years. We measured it rather than assume, and it won. Use it.
+
+What it does *not* do on `sm_61` is quantise attention — its own Pascal notes record that `fast_fp16_available`
+is false there, so attention runs in fp32. Measured cost: `qwen3:14b` drops 31% going from 1.9k to 15k tokens
+of context. The INT8 attention kernel in `attn.py` is built for exactly that gap, if anyone wants to take it on.
+
+**This node is for diffusion models**, where there is no equivalent. That is the gap it fills.
+
 ## Credits
 
 Author: **Khai Bustos** ([github.com/KhaiB10](https://github.com/KhaiB10)), developed with Claude (Anthropic). Spike splitting follows *LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale* (Dettmers et al., 2022). MIT license.
